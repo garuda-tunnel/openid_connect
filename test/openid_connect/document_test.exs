@@ -9,9 +9,9 @@ defmodule OpenIDConnect.DocumentTest do
     end
 
     test "returns valid document from a given url" do
-      {test_name, uri} = start_fixture("auth0")
+      {_bypass, uri} = start_fixture("auth0")
 
-      assert {:ok, document} = fetch_document(uri, req_test_options(test_name))
+      assert {:ok, document} = fetch_document(uri)
 
       assert %OpenIDConnect.Document{
                authorization_endpoint: "https://common.auth0.com/authorize",
@@ -49,8 +49,7 @@ defmodule OpenIDConnect.DocumentTest do
                token_endpoint: "https://common.auth0.com/oauth/token"
              } = document
 
-      # The fixture has Cache-Control: max-age=15, so expires_at should be ~15 seconds from now
-      assert DateTime.diff(expires_at, DateTime.utc_now()) in 13..17
+      assert DateTime.diff(expires_at, DateTime.utc_now()) in (60 * 60 - 10)..(60 * 60 + 10)
     end
 
     test "supports all gateway providers" do
@@ -64,17 +63,17 @@ defmodule OpenIDConnect.DocumentTest do
             "vault",
             "cognito"
           ] do
-        {test_name, uri} = start_fixture(provider)
-        assert {:ok, document} = fetch_document(uri, req_test_options(test_name))
+        {_bypass, uri} = start_fixture(provider)
+        assert {:ok, document} = fetch_document(uri)
         assert not is_nil(document.jwks)
       end
     end
 
     test "caches the document" do
-      {test_name, uri} = start_fixture("auth0")
+      {_bypass, uri} = start_fixture("auth0")
 
-      assert {:ok, document} = fetch_document(uri, req_test_options(test_name))
-      assert {:ok, ^document} = fetch_document(uri, req_test_options(test_name))
+      assert {:ok, document} = fetch_document(uri)
+      assert {:ok, ^document} = fetch_document(uri)
     end
 
     test "returns error when JSWKS is invalid" do
@@ -99,162 +98,136 @@ defmodule OpenIDConnect.DocumentTest do
         ]
       }
 
-      {test_name, uri} = start_fixture("auth0", %{"jwks" => invalid_jwks})
+      {_bypass, uri} = start_fixture("auth0", %{"jwks" => invalid_jwks})
 
-      assert fetch_document(uri, req_test_options(test_name)) ==
-               {:error, :invalid_jwks_certificates}
+      assert fetch_document(uri) == {:error, :invalid_jwks_certificates}
     end
 
     test "handles non 2XX response codes" do
-      test_name = unique_test_name()
+      bypass = Bypass.open()
 
-      Req.Test.stub(test_name, fn conn ->
-        conn |> Plug.Conn.put_status(401) |> Req.Test.json(%{})
+      Bypass.expect_once(bypass, "GET", "/.well-known/discovery-document.json", fn conn ->
+        Plug.Conn.resp(conn, 401, "{}")
       end)
 
-      uri = "http://#{test_name}/.well-known/discovery-document.json"
+      uri = "http://localhost:#{bypass.port}/.well-known/discovery-document.json"
 
-      assert fetch_document(uri, req_test_options(test_name)) == {:error, {401, "{}"}}
-    end
-
-    test "ignores documents larger than 1MB" do
-      test_name = unique_test_name()
-
-      # Just over 1MB (1MB + 1KB) is enough to trigger the size limit
-      large_document = String.duplicate("A", 1024 * 1024 + 1024)
-
-      Req.Test.stub(test_name, fn conn ->
-        Req.Test.text(conn, large_document)
-      end)
-
-      uri = "http://#{test_name}/.well-known/discovery-document.json"
-
-      assert fetch_document(uri, req_test_options(test_name)) ==
-               {:error, :discovery_document_is_too_large}
+      assert fetch_document(uri) == {:error, {401, "{}"}}
     end
 
     test "handles invalid responses" do
-      test_name = unique_test_name()
+      bypass = Bypass.open()
 
-      Req.Test.stub(test_name, fn conn ->
-        Req.Test.json(conn, %{})
+      Bypass.expect_once(bypass, "GET", "/.well-known/discovery-document.json", fn conn ->
+        Plug.Conn.resp(conn, 200, "{}")
       end)
 
-      uri = "http://#{test_name}/.well-known/discovery-document.json"
+      uri = "http://localhost:#{bypass.port}/.well-known/discovery-document.json"
 
-      assert fetch_document(uri, req_test_options(test_name)) == {:error, :invalid_document}
+      assert fetch_document(uri) == {:error, :invalid_document}
     end
 
     test "handles response errors" do
-      test_name = unique_test_name()
-      uri = "http://#{test_name}/.well-known/discovery-document.json"
+      bypass = Bypass.open()
+      uri = "http://localhost:#{bypass.port}/.well-known/discovery-document.json"
+      Bypass.down(bypass)
 
-      Req.Test.stub(test_name, fn conn ->
-        Req.Test.transport_error(conn, :econnrefused)
-      end)
-
-      assert fetch_document(uri, req_test_options(test_name)) ==
-               {:error, %Req.TransportError{reason: :econnrefused}}
+      assert fetch_document(uri) == {:error, %Mint.TransportError{reason: :econnrefused}}
     end
 
     test "takes expiration date from Cache-Control headers of the discovery document" do
-      test_name = unique_test_name()
-      endpoint = "http://#{test_name}/"
+      bypass = Bypass.open()
+      endpoint = "http://localhost:#{bypass.port}/"
       provider = "vault"
 
-      Req.Test.stub(test_name, fn conn ->
-        case conn.request_path do
-          "/.well-known/jwks.json" ->
-            {status_code, body, headers} = load_fixture(provider, "jwks")
-            send_response(conn, status_code, body, headers)
+      Bypass.expect_once(bypass, "GET", "/.well-known/jwks.json", fn conn ->
+        {status_code, body, headers} = load_fixture(provider, "jwks")
+        send_response(conn, status_code, body, headers)
+      end)
 
-          "/.well-known/discovery-document.json" ->
-            {status_code, body, headers} = load_fixture(provider, "discovery_document")
-            body = Map.merge(body, %{"jwks_uri" => "#{endpoint}.well-known/jwks.json"})
+      Bypass.expect_once(bypass, "GET", "/.well-known/discovery-document.json", fn conn ->
+        {status_code, body, headers} = load_fixture(provider, "discovery_document")
+        body = Map.merge(body, %{"jwks_uri" => "#{endpoint}.well-known/jwks.json"})
 
-            headers =
-              for {k, v} <- headers,
-                  k = String.downcase(k),
-                  k not in ["cache-control", "age"] do
-                {k, v}
-              end
+        headers =
+          for {k, v} <- headers,
+              k = String.downcase(k),
+              k not in ["cache-control", "age"] do
+            {k, v}
+          end
 
-            headers = headers ++ [{"cache-control", "max-age=300"}]
-            send_response(conn, status_code, body, headers)
-        end
+        headers = headers ++ [{"cache-control", "max-age=300"}]
+        send_response(conn, status_code, body, headers)
       end)
 
       uri = "#{endpoint}.well-known/discovery-document.json"
 
-      assert {:ok, document} = fetch_document(uri, req_test_options(test_name))
+      assert {:ok, document} = fetch_document(uri)
       expected_expires_at = DateTime.add(DateTime.utc_now(), 300, :second)
       assert DateTime.diff(document.expires_at, expected_expires_at) in -3..3
     end
 
     test "takes expiration date from Cache-Control and Age headers of the discovery document" do
-      test_name = unique_test_name()
-      endpoint = "http://#{test_name}/"
+      bypass = Bypass.open()
+      endpoint = "http://localhost:#{bypass.port}/"
       provider = "vault"
 
-      Req.Test.stub(test_name, fn conn ->
-        case conn.request_path do
-          "/.well-known/jwks.json" ->
-            {status_code, body, headers} = load_fixture(provider, "jwks")
-            send_response(conn, status_code, body, headers)
+      Bypass.expect_once(bypass, "GET", "/.well-known/jwks.json", fn conn ->
+        {status_code, body, headers} = load_fixture(provider, "jwks")
+        send_response(conn, status_code, body, headers)
+      end)
 
-          "/.well-known/discovery-document.json" ->
-            {status_code, body, headers} = load_fixture(provider, "discovery_document")
-            body = Map.merge(body, %{"jwks_uri" => "#{endpoint}.well-known/jwks.json"})
+      Bypass.expect_once(bypass, "GET", "/.well-known/discovery-document.json", fn conn ->
+        {status_code, body, headers} = load_fixture(provider, "discovery_document")
+        body = Map.merge(body, %{"jwks_uri" => "#{endpoint}.well-known/jwks.json"})
 
-            headers =
-              for {k, v} <- headers,
-                  k = String.downcase(k),
-                  k not in ["cache-control", "age"] do
-                {k, v}
-              end
+        headers =
+          for {k, v} <- headers,
+              k = String.downcase(k),
+              k not in ["cache-control", "age"] do
+            {k, v}
+          end
 
-            headers = headers ++ [{"cache-control", "max-age=300"}, {"age", "100"}]
-            send_response(conn, status_code, body, headers)
-        end
+        headers = headers ++ [{"cache-control", "max-age=300"}, {"age", "100"}]
+        send_response(conn, status_code, body, headers)
       end)
 
       uri = "#{endpoint}.well-known/discovery-document.json"
 
-      assert {:ok, document} = fetch_document(uri, req_test_options(test_name))
+      assert {:ok, document} = fetch_document(uri)
       expected_expires_at = DateTime.add(DateTime.utc_now(), 300 - 100, :second)
       assert DateTime.diff(document.expires_at, expected_expires_at) in -3..3
     end
 
     test "takes expiration date from Cache-Control and Age headers of the jwks document" do
-      test_name = unique_test_name()
-      endpoint = "http://#{test_name}/"
+      bypass = Bypass.open()
+      endpoint = "http://localhost:#{bypass.port}/"
       provider = "vault"
 
-      Req.Test.stub(test_name, fn conn ->
-        case conn.request_path do
-          "/.well-known/jwks.json" ->
-            {status_code, body, headers} = load_fixture(provider, "jwks")
+      Bypass.expect_once(bypass, "GET", "/.well-known/jwks.json", fn conn ->
+        {status_code, body, headers} = load_fixture(provider, "jwks")
 
-            headers =
-              for {k, v} <- headers,
-                  k = String.downcase(k),
-                  k not in ["cache-control", "age"] do
-                {k, v}
-              end
+        headers =
+          for {k, v} <- headers,
+              k = String.downcase(k),
+              k not in ["cache-control", "age"] do
+            {k, v}
+          end
 
-            headers = headers ++ [{"cache-control", "max-age=300"}, {"age", "100"}]
-            send_response(conn, status_code, body, headers)
+        headers = headers ++ [{"cache-control", "max-age=300"}, {"age", "100"}]
+        send_response(conn, status_code, body, headers)
+      end)
 
-          "/.well-known/discovery-document.json" ->
-            {status_code, body, headers} = load_fixture(provider, "discovery_document")
-            body = Map.merge(body, %{"jwks_uri" => "#{endpoint}.well-known/jwks.json"})
-            send_response(conn, status_code, body, headers)
-        end
+      Bypass.expect_once(bypass, "GET", "/.well-known/discovery-document.json", fn conn ->
+        {status_code, body, headers} = load_fixture(provider, "discovery_document")
+        body = Map.merge(body, %{"jwks_uri" => "#{endpoint}.well-known/jwks.json"})
+
+        send_response(conn, status_code, body, headers)
       end)
 
       uri = "#{endpoint}.well-known/discovery-document.json"
 
-      assert {:ok, document} = fetch_document(uri, req_test_options(test_name))
+      assert {:ok, document} = fetch_document(uri)
       expected_expires_at = DateTime.add(DateTime.utc_now(), 300 - 100, :second)
       assert DateTime.diff(document.expires_at, expected_expires_at) in -3..3
     end

@@ -1,5 +1,5 @@
 defmodule OpenIDConnect.Document do
-  @moduledoc """
+  @doc """
   This module caches OIDC documents and their JWKs for a limited timeframe, which is min(`@refresh_time`, `document.remaining_lifetime`).
   """
   alias OpenIDConnect.Document.Cache
@@ -20,25 +20,11 @@ defmodule OpenIDConnect.Document do
                           60 * 60
                         )
 
-  @document_max_byte_size Application.compile_env(
-                            :openid_connect,
-                            :document_max_byte_size,
-                            1024 * 1024
-                          )
-
-  @doc "Returns the cached document for `uri`, fetching and caching it on a cache miss."
-  def fetch_document(uri, req_opts \\ []) do
-    with :error <- Cache.fetch(uri) do
-      refresh_document(uri, req_opts)
-    end
-  end
-
-  @doc "Fetches a fresh document bypassing the cache. Replaces the cached entry only on success."
-  def refresh_document(uri, req_opts \\ []) do
-    with {:ok, document_json, document_expires_at} <- fetch_remote_resource(uri, req_opts),
+  def fetch_document(uri) do
+    with :error <- Cache.fetch(uri),
+         {:ok, document_json, document_expires_at} <- fetch_remote_resource(uri),
          {:ok, document} <- build_document(document_json),
-         {:ok, jwks_json, jwks_expires_at} <-
-           fetch_remote_resource(document_json["jwks_uri"], req_opts),
+         {:ok, jwks_json, jwks_expires_at} <- fetch_remote_resource(document_json["jwks_uri"]),
          {:ok, jwks} <- from_certs(jwks_json) do
       now = DateTime.utc_now()
 
@@ -57,19 +43,26 @@ defmodule OpenIDConnect.Document do
           expires_at: expires_at
       }
 
-      Cache.put(uri, document)
+      _ = Cache.put(uri, document)
 
       {:ok, document}
     end
   end
 
-  defp fetch_remote_resource(uri, _req_opts) when is_nil(uri),
-    do: {:error, :invalid_discovery_document_uri}
+  defp fetch_remote_resource(uri) when is_nil(uri), do: {:error, :invalid_discovery_document_uri}
 
-  defp fetch_remote_resource(uri, req_opts) do
-    with {:ok, %{headers: headers, body: response, status: status}}
-         when status in 200..299 <- read_response(uri, req_opts),
-         {:ok, json} <- JSON.decode(response) do
+  defp fetch_remote_resource(uri) do
+    request = Finch.build(:get, uri)
+
+    with {:ok,
+          %Finch.Response{
+            headers: headers,
+            body: response,
+            status: status
+          }}
+         when status in 200..299 <-
+           Finch.request(request, OpenIDConnect.Finch),
+         {:ok, json} <- Jason.decode(response) do
       expires_at =
         if remaining_lifetime = remaining_lifetime(headers) do
           DateTime.add(DateTime.utc_now(), remaining_lifetime, :second)
@@ -77,66 +70,17 @@ defmodule OpenIDConnect.Document do
 
       {:ok, json, expires_at}
     else
-      {:ok, %{body: body, status: status}} ->
-        {:error, {status, body}}
-
-      other ->
-        other
+      {:ok, %Finch.Response{body: response, status: status}} -> {:error, {status, response}}
+      other -> other
     end
   end
-
-  defp read_response(uri, req_opts) do
-    collector = body_collector(@document_max_byte_size)
-    options = Keyword.merge([into: collector, retry: retry_option()], req_opts)
-
-    case Req.get(uri, options) do
-      {:ok, %{body: {:error, :body_too_large}}} ->
-        {:error, :discovery_document_is_too_large}
-
-      {:ok, %{body: {:ok, body}} = response} ->
-        {:ok, %{response | body: IO.iodata_to_binary(body)}}
-
-      # Fallback for empty responses or when body_collector was never invoked
-      {:ok, response} ->
-        {:ok, response}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  defp body_collector(max_byte_size) do
-    fn {:data, data}, {req, resp} ->
-      {action, body} = collect_body_chunk(resp.body, data, max_byte_size)
-      {action, {req, %{resp | body: body}}}
-    end
-  end
-
-  defp collect_body_chunk(body, data, max_byte_size) do
-    acc = normalize_body_acc(body)
-
-    case acc do
-      {:error, _} = error ->
-        {:cont, error}
-
-      {:ok, chunks} ->
-        new_size = IO.iodata_length(chunks) + byte_size(data)
-
-        if new_size > max_byte_size do
-          # Use :cont instead of :halt because Req.Test's Plug adapter doesn't support :halt.
-          # Once we exceed the limit, we keep returning the error and ignore further data.
-          {:cont, {:error, :body_too_large}}
-        else
-          {:cont, {:ok, [chunks, data]}}
-        end
-    end
-  end
-
-  defp normalize_body_acc({:ok, _} = ok), do: ok
-  defp normalize_body_acc({:error, _} = error), do: error
-  defp normalize_body_acc(_), do: {:ok, []}
 
   defp remaining_lifetime(headers) do
+    headers =
+      for {k, v} <- headers, into: %{} do
+        {String.downcase(k), v}
+      end
+
     max_age = get_max_age(headers)
     age = get_age(headers)
 
@@ -147,46 +91,33 @@ defmodule OpenIDConnect.Document do
     end
   end
 
-  # Req returns headers as %{"header-name" => ["value1", "value2"]}.
-  # The binary fallback handles Plug/Bypass test fixtures which use single string values.
-  defp get_header(headers, name) do
-    case Map.get(headers, name) do
-      nil -> nil
-      [value | _] -> value
-      value when is_binary(value) -> value
+  defp get_max_age(headers) when is_map(headers) do
+    cache_control = Map.get(headers, "cache-control", "")
+
+    case Regex.run(~r"(?<=max-age=)\d+", cache_control) do
+      [max_age] -> String.to_integer(max_age)
+      _ -> nil
     end
   end
 
-  defp get_max_age(headers) do
-    case get_header(headers, "cache-control") do
-      nil ->
-        nil
-
-      cache_control ->
-        case Regex.run(~r"(?<=max-age=)\d+", cache_control) do
-          [max_age] -> String.to_integer(max_age)
-          _ -> nil
-        end
-    end
-  end
-
-  defp get_age(headers) do
-    case get_header(headers, "age") do
+  defp get_age(headers) when is_map(headers) do
+    case Map.get(headers, "age") do
       nil -> nil
       age -> String.to_integer(age)
     end
   end
 
   defp build_document(document_json) do
+    keys = Map.keys(document_json)
     required_keys = ["jwks_uri", "authorization_endpoint", "token_endpoint"]
 
-    if Enum.all?(required_keys, &Map.has_key?(document_json, &1)) do
+    if Enum.all?(required_keys, &(&1 in keys)) do
       document = %__MODULE__{
         raw: document_json,
         authorization_endpoint: Map.fetch!(document_json, "authorization_endpoint"),
         end_session_endpoint: Map.get(document_json, "end_session_endpoint"),
         token_endpoint: Map.fetch!(document_json, "token_endpoint"),
-        userinfo_endpoint: Map.get(document_json, "userinfo_endpoint"),
+        userinfo_endpoint: Map.fetch!(document_json, "userinfo_endpoint"),
         response_types_supported:
           Map.get(document_json, "response_types_supported")
           |> Enum.map(fn response_type ->
@@ -213,9 +144,5 @@ defmodule OpenIDConnect.Document do
     {:ok, JOSE.JWK.from(certs)}
   rescue
     _ -> {:error, :invalid_jwks_certificates}
-  end
-
-  defp retry_option do
-    Application.get_env(:openid_connect, :retry, :safe_transient)
   end
 end

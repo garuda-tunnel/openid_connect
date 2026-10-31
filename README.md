@@ -99,9 +99,7 @@ get("/session/authorization-uri", SessionController, :authorization_uri)
 # you could also take the `provider` as a query param to pass into the function
 def authorization_uri(conn, _params) do
   google_config = Application.fetch_env!(:my_app, :google_oidc_config)
-  {:ok, uri} = OpenIDConnect.authorization_uri(google_config)
-
-  json(conn, %{uri: uri})
+  json(conn, %{uri: OpenIDConnect.authorization_uri(google_config)})
 end
 
 # The `Authentication` module here is an imaginary interface for setting session state

@@ -3,7 +3,6 @@ defmodule OpenIDConnect do
   Handles a majority of the life-cycle concerns with [OpenID Connect](http://openid.net/connect/)
   """
   alias OpenIDConnect.Document
-  alias OpenIDConnect.Document.Cache
 
   @typedoc """
   URL to a [OpenID Discovery Document](https://openid.net/specs/openid-connect-discovery-1_0.html) endpoint.
@@ -51,10 +50,10 @@ defmodule OpenIDConnect do
           required(:discovery_document_uri) => discovery_document_uri(),
           required(:client_id) => client_id(),
           required(:client_secret) => client_secret(),
+          required(:redirect_uri) => redirect_uri(),
           required(:response_type) => response_type(),
           required(:scope) => scope(),
-          optional(:leeway) => non_neg_integer(),
-          optional(:req_opts) => keyword()
+          optional(:leeway) => non_neg_integer()
         }
 
   @typedoc """
@@ -75,23 +74,19 @@ defmodule OpenIDConnect do
   > It is *highly suggested* that you add the `state` param for security reasons. Your
   > OpenID Connect provider should have more information on this topic.
   """
-  @spec authorization_uri(
-          config(),
-          redirect_uri :: redirect_uri(),
-          params :: %{optional(atom) => term()}
-        ) :: {:ok, uri :: String.t()} | {:error, term()}
-  def authorization_uri(config, redirect_uri, params \\ %{}) do
+  @spec authorization_uri(config(), params :: %{optional(atom) => term()}) ::
+          {:ok, uri :: String.t()} | {:error, term()}
+  def authorization_uri(config, params \\ %{}) do
     discovery_document_uri = config.discovery_document_uri
-    req_opts = Map.get(config, :req_opts, [])
 
-    with {:ok, document} <- Document.fetch_document(discovery_document_uri, req_opts),
+    with {:ok, document} <- Document.fetch_document(discovery_document_uri),
          {:ok, response_type} <- fetch_response_type(config, document),
          {:ok, scope} <- fetch_scope(config) do
       params =
         Map.merge(
           %{
             client_id: config.client_id,
-            redirect_uri: redirect_uri,
+            redirect_uri: config.redirect_uri,
             response_type: response_type,
             scope: scope
           },
@@ -158,9 +153,8 @@ defmodule OpenIDConnect do
           {:ok, uri :: String.t()} | {:error, term()}
   def end_session_uri(config, params \\ %{}) do
     discovery_document_uri = config.discovery_document_uri
-    req_opts = Map.get(config, :req_opts, [])
 
-    with {:ok, document} <- Document.fetch_document(discovery_document_uri, req_opts) do
+    with {:ok, document} <- Document.fetch_document(discovery_document_uri) do
       if end_session_endpoint = document.end_session_endpoint do
         params = Map.merge(%{client_id: config.client_id}, params)
         {:ok, build_uri(end_session_endpoint, params)}
@@ -171,36 +165,39 @@ defmodule OpenIDConnect do
   end
 
   @doc """
-  Fetches the authentication tokens from the provider using the token endpoint retrieved from a discovery document.
+  Fetches the authentication tokens from the provider
 
-  The `params` option depends on the `grant_type`:
-
-    * for "authorization_code" grant type, `params` should at least include the `redirect_uri` and `code` params;
-    * for "refresh_token" grant type, `params` should at least include the `refresh_token` param;
-    * for other grant types and more details see the
-    [OpenID Connect spec](https://openid.net/specs/openid-connect-core-1_0.html#TokenEndpoint).
-
-  `params` may also include any one-off overrides for token fetching.
+  The `params` option should at least include the key/value pairs of the `response_type` that
+  was requested during authorization. `params` may also include any one-off overrides for token
+  fetching.
   """
   @spec fetch_tokens(config(), params :: %{optional(atom) => term()}) ::
           {:ok, response :: map()} | {:error, term()}
   def fetch_tokens(config, params) do
     discovery_document_uri = config.discovery_document_uri
-    req_opts = Map.get(config, :req_opts, [])
 
-    form_params =
-      %{client_id: config.client_id, client_secret: config.client_secret}
-      |> Map.merge(params)
+    form_body =
+      Map.merge(
+        %{
+          client_id: config.client_id,
+          client_secret: config.client_secret,
+          redirect_uri: config.redirect_uri,
+          grant_type: "authorization_code"
+        },
+        params
+      )
+      |> URI.encode_query(:www_form)
 
-    with {:ok, document} <- Document.fetch_document(discovery_document_uri, req_opts),
-         {:ok, %{status: status, body: body}} when status in 200..299 <-
-           Req.post(
-             document.token_endpoint,
-             Keyword.merge([form: form_params, retry: retry_option()], req_opts)
-           ) do
-      {:ok, decode_body(body)}
+    headers = [{"Content-Type", "application/x-www-form-urlencoded"}]
+
+    with {:ok, document} <- Document.fetch_document(discovery_document_uri),
+         request = Finch.build(:post, document.token_endpoint, headers, form_body),
+         {:ok, %Finch.Response{body: response, status: status}} when status in 200..299 <-
+           Finch.request(request, OpenIDConnect.Finch),
+         {:ok, json} <- Jason.decode(response) do
+      {:ok, json}
     else
-      {:ok, %{status: status, body: body}} -> {:error, {status, decode_body(body)}}
+      {:ok, %Finch.Response{body: response, status: status}} -> {:error, {status, response}}
       other -> other
     end
   end
@@ -215,101 +212,27 @@ defmodule OpenIDConnect do
           {:ok, claims :: map()} | {:error, term()}
   def verify(config, jwt) do
     discovery_document_uri = config.discovery_document_uri
-    req_opts = Map.get(config, :req_opts, [])
 
-    with {:ok, token_alg, token_kid} <- peek_token_header(jwt) do
-      verify_with_retry(config, jwt, token_alg, token_kid, discovery_document_uri, req_opts)
-    end
-  end
-
-  defp verify_with_retry(config, jwt, token_alg, token_kid, uri, req_opts) do
-    # Snapshot pre-call so we only retry when JWKS was cached (cold cache = already fresh).
-    pre_cached = Cache.peek(uri)
-
-    case do_verify(config, jwt, token_alg, uri, req_opts) do
-      {:error, {:invalid_jwt, "verification failed"}} = error ->
-        retry_verify(config, jwt, token_alg, token_kid, uri, req_opts, pre_cached, error)
-
-      result ->
-        result
-    end
-  end
-
-  # Refresh out-of-band so a failed refetch (provider unreachable) leaves the old
-  # cached JWKS intact for legitimate cached-key-signed tokens. `allow_refresh?`
-  # enforces a per-URI cooldown to throttle DoS via unknown-kid spam.
-  defp retry_verify(config, jwt, token_alg, token_kid, uri, req_opts, pre_cached, error) do
-    with true <- should_refresh_jwks?(token_kid, pre_cached),
-         true <- Cache.allow_refresh?(uri),
-         {:ok, _fresh} <- Document.refresh_document(uri, req_opts) do
-      do_verify(config, jwt, token_alg, uri, req_opts)
-    else
-      _ -> error
-    end
-  end
-
-  # Only refresh on an unexpired cached doc whose JWKS lacks the token's kid —
-  # otherwise it's either a cold cache, a tampered token, or already refetched.
-  defp should_refresh_jwks?(kid, {:ok, %Document{jwks: jwks, expires_at: expires_at}})
-       when is_binary(kid) do
-    DateTime.compare(expires_at, DateTime.utc_now()) == :gt and not kid_in_jwks?(kid, jwks)
-  end
-
-  defp should_refresh_jwks?(_kid, _pre_cached), do: false
-
-  defp kid_in_jwks?(kid, %JOSE.JWK{keys: {:jose_jwk_set, jwks}}) do
-    Enum.any?(jwks, fn raw_jwk ->
-      raw_jwk |> JOSE.JWK.from() |> jwk_kid() == kid
-    end)
-  end
-
-  defp kid_in_jwks?(kid, %JOSE.JWK{} = jwk), do: jwk_kid(jwk) == kid
-  defp kid_in_jwks?(_kid, _jwks), do: false
-
-  defp jwk_kid(%JOSE.JWK{fields: fields}), do: Map.get(fields, "kid")
-  defp jwk_kid(_), do: nil
-
-  defp peek_token_header(jwt) do
     with {:ok, protected} <- peek_protected(jwt),
-         {:ok, decoded_protected} <- JSON.decode(protected),
-         {:ok, token_alg} <- Map.fetch(decoded_protected, "alg") do
-      {:ok, token_alg, Map.get(decoded_protected, "kid")}
+         {:ok, decoded_protected} <- Jason.decode(protected),
+         {:ok, token_alg} <- Map.fetch(decoded_protected, "alg"),
+         {:ok, document} <- Document.fetch_document(discovery_document_uri),
+         {true, claims, _jwk} <- verify_signature(document.jwks, token_alg, jwt),
+         {:ok, unverified_claims} <- Jason.decode(claims),
+         {:ok, verified_claims} <- verify_claims(unverified_claims, config) do
+      {:ok, verified_claims}
     else
-      {:error, {:unexpected_end, _position}} ->
-        {:error, {:invalid_jwt, "token header JSON is incomplete"}}
-
-      {:error, {:invalid_byte, _position, _byte}} ->
-        {:error, {:invalid_jwt, "token header contains invalid JSON"}}
-
-      {:error, {:unexpected_sequence, _position, _bytes}} ->
-        {:error, {:invalid_jwt, "token header contains invalid UTF-8 escape sequence"}}
+      {:error, %Jason.DecodeError{}} ->
+        {:error, {:invalid_jwt, "token claims did not contain a JSON payload"}}
 
       {:error, :peek_protected} ->
         {:error, {:invalid_jwt, "invalid token format"}}
 
-      :error ->
-        {:error, {:invalid_jwt, "no `alg` found in token"}}
-    end
-  end
-
-  defp do_verify(config, jwt, token_alg, discovery_document_uri, req_opts) do
-    with {:ok, document} <- Document.fetch_document(discovery_document_uri, req_opts),
-         {true, claims, _jwk} <- verify_signature(document.jwks, token_alg, jwt),
-         {:ok, unverified_claims} <- JSON.decode(claims),
-         {:ok, verified_claims} <- verify_claims(unverified_claims, config) do
-      {:ok, verified_claims}
-    else
-      {:error, {:unexpected_end, _position}} ->
-        {:error, {:invalid_jwt, "token claims JSON is incomplete"}}
-
-      {:error, {:invalid_byte, _position, _byte}} ->
-        {:error, {:invalid_jwt, "token claims contain invalid JSON"}}
-
-      {:error, {:unexpected_sequence, _position, _bytes}} ->
-        {:error, {:invalid_jwt, "token claims contain invalid UTF-8 escape sequence"}}
-
       {:error, invalid_claim, message} ->
         {:error, {:invalid_jwt, "invalid #{invalid_claim} claim: #{message}"}}
+
+      :error ->
+        {:error, {:invalid_jwt, "no `alg` found in token"}}
 
       {false, _claims, _jwk} ->
         {:error, {:invalid_jwt, "verification failed"}}
@@ -322,8 +245,8 @@ defmodule OpenIDConnect do
     end
   end
 
-  defp peek_protected(jwt) do
-    {:ok, JOSE.JWS.peek_protected(jwt)}
+  defp peek_protected(jwks) do
+    {:ok, JOSE.JWS.peek_protected(jwks)}
   rescue
     _ -> {:error, :peek_protected}
   end
@@ -335,8 +258,7 @@ defmodule OpenIDConnect do
       |> verify_signature(token_alg, jwt)
       |> case do
         {false, _claims, _jwt} -> false
-        {true, claims, jwt} -> {true, claims, jwt}
-        _other -> false
+        verified_claims -> verified_claims
       end
     end)
   end
@@ -386,35 +308,20 @@ defmodule OpenIDConnect do
   defp audience_matches?(aud, expected_aud) when is_list(aud), do: Enum.member?(aud, expected_aud)
   defp audience_matches?(aud, expected_aud), do: aud === expected_aud
 
-  @doc "Fetches the userinfo claims for `access_token` from the provider's userinfo endpoint."
   def fetch_userinfo(config, access_token) do
     discovery_document_uri = config.discovery_document_uri
-    req_opts = Map.get(config, :req_opts, [])
 
     headers = [{"Authorization", "Bearer #{access_token}"}]
 
-    with {:ok, document} <- Document.fetch_document(discovery_document_uri, req_opts),
-         true <- not is_nil(document.userinfo_endpoint),
-         {:ok, %{status: status, body: body}} when status in 200..299 <-
-           Req.get(
-             document.userinfo_endpoint,
-             Keyword.merge([headers: headers, retry: retry_option()], req_opts)
-           ) do
-      {:ok, decode_body(body)}
+    with {:ok, document} <- Document.fetch_document(discovery_document_uri),
+         request = Finch.build(:get, document.userinfo_endpoint, headers),
+         {:ok, %Finch.Response{body: response, status: status}} when status in 200..299 <-
+           Finch.request(request, OpenIDConnect.Finch),
+         {:ok, json} <- Jason.decode(response) do
+      {:ok, json}
     else
-      {:ok, %{status: status, body: body}} -> {:error, {status, decode_body(body)}}
-      false -> {:error, :userinfo_endpoint_is_not_implemented}
+      {:ok, %Finch.Response{body: response, status: status}} -> {:error, {status, response}}
       other -> other
-    end
-  end
-
-  defp decode_body(nil), do: nil
-  defp decode_body(body) when is_map(body), do: body
-
-  defp decode_body(body) when is_binary(body) do
-    case JSON.decode(body) do
-      {:ok, json} -> json
-      {:error, _} -> body
     end
   end
 
@@ -424,9 +331,5 @@ defmodule OpenIDConnect do
     uri
     |> URI.merge("?#{query}")
     |> URI.to_string()
-  end
-
-  defp retry_option do
-    Application.get_env(:openid_connect, :retry, :safe_transient)
   end
 end

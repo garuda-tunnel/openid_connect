@@ -1,13 +1,13 @@
 defmodule OpenIDConnect.Mixfile do
   use Mix.Project
 
-  @version "1.0.0"
+  @version "2.0.0"
 
   def project do
     [
       app: :openid_connect,
       version: @version,
-      elixir: "~> 1.18",
+      elixir: "~> 1.12",
       build_embedded: Mix.env() == :prod,
       start_permanent: Mix.env() == :prod,
       elixirc_paths: elixirc_paths(Mix.env()),
@@ -16,9 +16,9 @@ defmodule OpenIDConnect.Mixfile do
       name: "OpenID Connect",
       deps: deps(),
       docs: docs(),
+      name: "OpenID Connect",
       source_url: "https://github.com/DockYard/openid_connect",
-      test_coverage: [tool: ExCoveralls],
-      test_ignore_filters: [~r"/fixtures/"]
+      test_coverage: [tool: ExCoveralls]
     ]
   end
 
@@ -69,19 +69,18 @@ defmodule OpenIDConnect.Mixfile do
 
   defp deps do
     [
-      {:req, "~> 0.5"},
-      {:jose, "~> 1.11"},
+      {:jason, ">= 1.0.0"},
+      {:finch, "~> 0.14"},
+      {:jose, "~> 1.8"},
 
-      # Dev deps
+      # Test deps
       {:earmark, "~> 1.2", only: :dev},
       {:credo, "~> 1.6", only: :dev},
       {:dialyxir, "~> 1.2", only: :dev},
       {:ex_doc, "~> 0.18", only: :dev},
-
-      # Test deps
-      # Plug is required for Req.Test (optional in Req, but needed for test stubs)
-      {:plug, "~> 1.0", only: :test},
-      {:excoveralls, "~> 0.14", only: :test}
+      {:excoveralls, "~> 0.14", only: :test},
+      {:plug_cowboy, "~> 2.6", only: :test},
+      {:bypass, "~> 2.1", only: :test}
     ]
   end
 end
